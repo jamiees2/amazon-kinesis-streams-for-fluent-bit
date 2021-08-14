@@ -11,4 +11,4 @@ id=$(docker create $IMAGE)
 docker cp $id:/app/bin/. ./bin/
 docker rm $id
 
-md5sum ./bin/*
+sha256sum ./bin/*
