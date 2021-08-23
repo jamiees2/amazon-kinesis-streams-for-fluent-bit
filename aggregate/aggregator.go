@@ -98,14 +98,13 @@ func (a *Aggregator) AddRecord(partitionKey string, hasPartitionKey bool, data [
 			return entry, err
 		}
 
-		// choose a new partition key now that we've aggregated the previous records
 		if !hasPartitionKey {
+			// choose a new partition key if needed now that we've aggregated the previous records
 			partitionKey = a.stringGen.RandomString()
-			// Recompute field size, since it may have changed
-			pKeyIdx, _ = a.checkPartitionKey(partitionKey)
-			pkeyFieldSize = protowire.SizeVarint(pKeyIdx) + fieldNumberSize
 		}
-
+		// Recompute field size, since it changed
+		pKeyIdx, _ = a.checkPartitionKey(partitionKey)
+		pkeyFieldSize = protowire.SizeVarint(pKeyIdx) + fieldNumberSize
 	}
 
 	// Add new record, and update aggSize
