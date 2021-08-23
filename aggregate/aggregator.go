@@ -4,9 +4,11 @@ import (
 	"crypto/md5"
 	"fmt"
 
+	"github.com/aws/amazon-kinesis-streams-for-fluent-bit/util"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/kinesis"
 	"github.com/sirupsen/logrus"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -23,73 +25,86 @@ const (
 	fieldNumberSize         = 1 // All field numbers are below 16, meaning they will only take up 1 byte
 )
 
-// Effectively just ceil(log base 128 of int)
-// The size in bytes that the protobuf representation will take
-func varint64Size(varint uint64) (size int) {
-	size = 1
-	for varint >= 0x80 {
-		size += 1
-		varint >>= 7;
-	}
-	return size;
-}
-
-func varintSize(varint int) (size int) {
-	return varint64Size(uint64(varint))
-}
-
 // Aggregator kinesis aggregator
 type Aggregator struct {
 	partitionKeys    map[string]uint64
 	records          []*Record
 	aggSize          int // Size of both records, and partitionKeys in bytes
 	maxAggRecordSize int
+	stringGen        *util.RandomStringGenerator
 }
 
 // NewAggregator create a new aggregator
-func NewAggregator() *Aggregator {
+func NewAggregator(stringGen *util.RandomStringGenerator) *Aggregator {
 
 	return &Aggregator{
 		partitionKeys:    make(map[string]uint64, 0),
 		records:          make([]*Record, 0),
 		maxAggRecordSize: defaultMaxAggRecordSize,
 		aggSize:          initialAggRecordSize,
+		stringGen:        stringGen,
 	}
 }
 
 // AddRecord to the aggregate buffer.
 // Will return a kinesis PutRecordsRequest once buffer is full, or if the data exceeds the aggregate limit.
-func (a *Aggregator) AddRecord(partitionKey string, data []byte) (entry *kinesis.PutRecordsRequestEntry, err error) {
+func (a *Aggregator) AddRecord(partitionKey string, hasPartitionKey bool, data []byte) (entry *kinesis.PutRecordsRequestEntry, err error) {
 
-	partitionKeySize := len([]byte(partitionKey))
-	if partitionKeySize < 1 {
-		return nil, fmt.Errorf("Invalid partition key provided")
+	if hasPartitionKey {
+		partitionKeySize := len([]byte(partitionKey))
+		if partitionKeySize < 1 {
+			return nil, fmt.Errorf("Invalid partition key provided")
+		}
 	}
 
 	dataSize := len(data)
 
 	// If this is a very large record, then don't aggregate it.
 	if dataSize >= a.maxAggRecordSize {
+		if !hasPartitionKey {
+			partitionKey = a.stringGen.RandomString()
+		}
 		return &kinesis.PutRecordsRequestEntry{
 			Data:         data,
 			PartitionKey: aws.String(partitionKey),
 		}, nil
 	}
+
+	if !hasPartitionKey {
+		if len(a.partitionKeys) > 0 {
+			// Take the first partition key from the map, if any
+			for k, _ := range a.partitionKeys {
+				partitionKey = k
+				break
+			}
+		} else {
+			partitionKey = a.stringGen.RandomString()
+		}
+	}
+
 	// Check if we need to add a new partition key, and if we do how much space it will take
 	pKeyIdx, pKeyAddedSize := a.checkPartitionKey(partitionKey)
 
-	// data field size is data length + varint of data length size + data field number size
+	// data field size is proto size of data + data field number size
 	// partition key field size is varint of index size + field number size
-	recordSize := dataSize + varintSize(dataSize) + fieldNumberSize + varint64Size(pKeyIdx) + fieldNumberSize
-	// Total size is record size + varint of record size size + field number of parent proto
-	addedSize := recordSize + varintSize(recordSize) + fieldNumberSize
+	dataFieldSize := protowire.SizeBytes(dataSize) + fieldNumberSize
+	pkeyFieldSize := protowire.SizeVarint(pKeyIdx) + fieldNumberSize
+	// Total size is byte size of data + pkey field + field number of parent proto
 
-	if a.getSize() + addedSize + pKeyAddedSize >= maximumRecordSize {
-		// Aggregate records, and return
+	if a.getSize()+protowire.SizeBytes(dataFieldSize+pkeyFieldSize)+fieldNumberSize+pKeyAddedSize >= maximumRecordSize {
+		// Aggregate records, and return if error
 		entry, err = a.AggregateRecords()
 		if err != nil {
 			return entry, err
 		}
+
+		if !hasPartitionKey {
+			// choose a new partition key if needed now that we've aggregated the previous records
+			partitionKey = a.stringGen.RandomString()
+		}
+		// Recompute field size, since it changed
+		pKeyIdx, _ = a.checkPartitionKey(partitionKey)
+		pkeyFieldSize = protowire.SizeVarint(pKeyIdx) + fieldNumberSize
 	}
 
 	// Add new record, and update aggSize
@@ -100,7 +115,7 @@ func (a *Aggregator) AddRecord(partitionKey string, data []byte) (entry *kinesis
 		PartitionKeyIndex: &partitionKeyIndex,
 	})
 
-	a.aggSize += addedSize
+	a.aggSize += protowire.SizeBytes(dataFieldSize+pkeyFieldSize) + fieldNumberSize
 
 	return entry, err
 }
@@ -158,7 +173,7 @@ func (a *Aggregator) addPartitionKey(partitionKey string) uint64 {
 	a.partitionKeys[partitionKey] = idx
 
 	partitionKeyLen := len([]byte(partitionKey))
-	a.aggSize += partitionKeyLen + varintSize(partitionKeyLen) + fieldNumberSize
+	a.aggSize += protowire.SizeBytes(partitionKeyLen) + fieldNumberSize
 	return idx
 }
 
@@ -169,7 +184,7 @@ func (a *Aggregator) checkPartitionKey(partitionKey string) (uint64, int) {
 
 	idx := uint64(len(a.partitionKeys))
 	partitionKeyLen := len([]byte(partitionKey))
-	return idx, partitionKeyLen + varintSize(partitionKeyLen) + fieldNumberSize
+	return idx, protowire.SizeBytes(partitionKeyLen) + fieldNumberSize
 }
 
 func (a *Aggregator) getPartitionKeys() []string {
